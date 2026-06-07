@@ -1782,6 +1782,20 @@ pub async fn init() -> Result<MemoryAgentHandle> {
         .get_or_init(|| async {
             let (tx, rx) = mpsc::channel(CONTEXT_CHANNEL_CAPACITY);
 
+            // Headless / eval runs can opt out of the memory subsystem: the embedding
+            // model load is CPU/IO-heavy and (lacking spawn_blocking) stalls a Tokio worker
+            // on cold start, which intermittently starves the in-flight model API request
+            // and hangs `jcode run`. JCODE_DISABLE_MEMORY skips spawning the agent loop —
+            // the handle's sends then no-op (receiver dropped).
+            let disabled = std::env::var("JCODE_DISABLE_MEMORY")
+                .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+                .unwrap_or(false);
+            if disabled {
+                crate::logging::info("Memory agent disabled via JCODE_DISABLE_MEMORY");
+                drop(rx);
+                return MemoryAgentHandle { tx };
+            }
+
             // Spawn the memory agent task
             let agent = MemoryAgent::new(rx);
             tokio::spawn(agent.run());
