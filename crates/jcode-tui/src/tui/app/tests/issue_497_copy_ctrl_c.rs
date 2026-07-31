@@ -61,3 +61,17 @@ fn test_ctrl_c_in_copy_mode_without_selection_still_falls_through() {
         "Ctrl+C without a selection keeps interrupt/quit behavior"
     );
 }
+
+#[test]
+fn test_failed_copy_leaves_copy_mode_so_ctrl_c_can_quit() {
+    let mut app = create_test_app();
+    app.enter_copy_selection_mode();
+
+    assert!(!app.finish_copy_selection_attempt(false));
+    assert!(!app.copy_selection_mode);
+    assert!(!app.handle_quit_request());
+    assert!(
+        app.quit_pending.is_some(),
+        "Ctrl+C must reach the normal quit handler after a failed copy"
+    );
+}

@@ -379,13 +379,18 @@ impl App {
             self.set_status_notice("Selection is empty");
             return false;
         }
-        let success = copy_text(&text);
-        if success {
-            self.set_status_notice("Copied selection");
-            self.exit_copy_selection_mode();
+        self.finish_copy_selection_attempt(copy_text(&text))
+    }
+
+    pub(super) fn finish_copy_selection_attempt(&mut self, success: bool) -> bool {
+        self.set_status_notice(if success {
+            "Copied selection"
         } else {
-            self.set_status_notice("Failed to copy selection");
-        }
+            "Failed to copy selection"
+        });
+        // A failed clipboard write cannot be retried through the same modal:
+        // Ctrl+C would remain trapped as copy forever and prevent quitting.
+        self.exit_copy_selection_mode();
         success
     }
 
@@ -586,9 +591,7 @@ impl App {
                 if self.copy_selection_mode {
                     return Some(false);
                 }
-                if !self.copy_current_selection_to_clipboard_with(copy_text) {
-                    self.exit_copy_selection_mode();
-                }
+                self.copy_current_selection_to_clipboard_with(copy_text);
                 Some(false)
             }
             MouseEventKind::ScrollUp => {

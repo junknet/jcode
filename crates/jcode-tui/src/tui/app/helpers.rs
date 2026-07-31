@@ -7,6 +7,8 @@ use crate::tui::info_widget::{AmbientWidgetData, GitInfo, MemoryInfo};
 use crate::tui::session_picker::ResumeTarget;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "linux", not(test)))]
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -19,6 +21,15 @@ static AMBIENT_INFO_CACHE: Mutex<Option<AmbientInfoCacheEntry>> = Mutex::new(Non
 /// edits) instead of waiting out the TTL with a stale branch/dirty count.
 type GitInfoCacheEntry = (std::time::Instant, Option<GitInfo>, bool);
 static GIT_INFO_CACHE: Mutex<Option<GitInfoCacheEntry>> = Mutex::new(None);
+
+/// Keep Linux clipboard ownership alive for the TUI lifetime.
+///
+/// X11 and Wayland selections are hosted by their owner. A short-lived
+/// `arboard::Clipboard` releases the copied text as soon as it drops unless a
+/// clipboard manager happens to persist it.
+#[cfg(all(target_os = "linux", not(test)))]
+static LINUX_CLIPBOARD: LazyLock<Mutex<Option<arboard::Clipboard>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Stale-while-revalidate cache for per-session todos plus their goal-level
 /// assessments (closed feedback loop etc.). Module-level so the app can force a
@@ -363,10 +374,11 @@ pub(crate) fn stop_capturing_clipboard_for_tests() {
     }
 }
 
-/// Copy text to clipboard. On Windows and macOS, the native clipboard API
-/// (arboard) is authoritative, with OSC 52 as a remote-session fallback.
-/// Elsewhere, try wl-copy first (Wayland), then OSC 52 (works over SSH /
-/// Docker / tmux), then arboard as a final fallback.
+/// Copy text to the system clipboard.
+///
+/// Linux uses the native Wayland/X11 clipboard when a display is present. OSC
+/// 52 is reserved for headless or remote terminals, where no local clipboard
+/// protocol can confirm ownership.
 pub(super) fn copy_to_clipboard(text: &str) -> bool {
     // Under test, never touch the OS clipboard. Beyond making results identical
     // on a desktop and a headless runner, the Linux path below spawns `wl-copy`,
@@ -388,113 +400,140 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
         return true;
     }
 
-    // On Windows, the native clipboard API must run before OSC 52. Writing an
-    // OSC 52 sequence to stdout "succeeds" even when the console (conhost,
-    // older Windows Terminal) silently ignores it, which reported "Copied"
-    // while leaving the clipboard empty (issue #497). arboard talks to the
-    // Win32 clipboard directly and is authoritative there.
-    #[cfg(windows)]
+    #[cfg(not(test))]
     {
-        if arboard::Clipboard::new()
-            .and_then(|mut cb| cb.set_text(text.to_string()))
-            .is_ok()
+        // On Windows, the native clipboard API must run before OSC 52. Writing an
+        // OSC 52 sequence to stdout "succeeds" even when the console (conhost,
+        // older Windows Terminal) silently ignores it, which reported "Copied"
+        // while leaving the clipboard empty (issue #497). arboard talks to the
+        // Win32 clipboard directly and is authoritative there.
+        #[cfg(windows)]
         {
-            return true;
-        }
-        return copy_to_clipboard_osc52(text);
-    }
-
-    // Same class of bug on macOS: Apple Terminal (Terminal.app) silently
-    // ignores OSC 52, yet writing the sequence to stdout "succeeds", so we
-    // reported "Copied" while leaving the clipboard untouched. NSPasteboard
-    // via arboard (with pbcopy as a belt-and-braces fallback) is authoritative
-    // for local sessions; OSC 52 remains as the final remote-session fallback.
-    #[cfg(target_os = "macos")]
-    {
-        if arboard::Clipboard::new()
-            .and_then(|mut cb| cb.set_text(text.to_string()))
-            .is_ok()
-        {
-            return true;
-        }
-        if let Ok(mut child) = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            use std::io::Write;
-            if let Some(stdin) = child.stdin.as_mut()
-                && stdin.write_all(text.as_bytes()).is_ok()
+            if arboard::Clipboard::new()
+                .and_then(|mut cb| cb.set_text(text.to_string()))
+                .is_ok()
             {
-                drop(child.stdin.take());
-                if child.wait().map(|s| s.success()).unwrap_or(false) {
-                    return true;
-                }
+                return true;
             }
+            return copy_to_clipboard_osc52(text);
         }
-        return copy_to_clipboard_osc52(text);
-    }
 
-    // Linux has the same failure class (issue #504, Kali/X11): wl-copy fails
-    // outside Wayland, and many terminals (xterm, older VTE) silently ignore
-    // OSC 52 while the stdout write still "succeeds", so the arboard fallback
-    // never ran. Prefer native clipboards when a display is available: wl-copy
-    // (Wayland), then arboard (X11), and only then OSC 52 for genuinely
-    // headless/remote sessions (SSH, Docker, tmux) where both native paths
-    // fail fast for lack of a display server.
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        if let Ok(mut child) = std::process::Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
+        // Same class of bug on macOS: Apple Terminal (Terminal.app) silently
+        // ignores OSC 52, yet writing the sequence to stdout "succeeds", so we
+        // reported "Copied" while leaving the clipboard untouched. NSPasteboard
+        // via arboard (with pbcopy as a belt-and-braces fallback) is authoritative
+        // for local sessions; OSC 52 remains as the final remote-session fallback.
+        #[cfg(target_os = "macos")]
         {
-            use std::io::Write;
-            if let Some(stdin) = child.stdin.as_mut()
-                && stdin.write_all(text.as_bytes()).is_ok()
+            if arboard::Clipboard::new()
+                .and_then(|mut cb| cb.set_text(text.to_string()))
+                .is_ok()
             {
-                drop(child.stdin.take());
-                // Do not block the caller on `wait()`. `wl-copy` forks a
-                // clipboard server that stays alive to serve paste requests, so
-                // waiting can hang for as long as the clipboard is owned. This
-                // runs on the UI thread from copy keybindings, where a stall is
-                // felt directly as input lag. Poll briefly for an early failure
-                // (e.g. no Wayland display) so the arboard/OSC 52 fallbacks
-                // still run, then treat a live child as success and reap it in
-                // the background.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) if status.success() => return true,
-                        Ok(Some(_)) => break, // exited nonzero: fall through
-                        Ok(None) => {
-                            if std::time::Instant::now() >= deadline {
-                                // Still running: wl-copy became the clipboard
-                                // owner, which is the success case.
-                                std::thread::spawn(move || {
-                                    let _ = child.wait();
-                                });
-                                return true;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                        }
-                        Err(_) => break,
+                return true;
+            }
+            if let Ok(mut child) = std::process::Command::new("pbcopy")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                use std::io::Write;
+                if let Some(stdin) = child.stdin.as_mut()
+                    && stdin.write_all(text.as_bytes()).is_ok()
+                {
+                    drop(child.stdin.take());
+                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+                        return true;
                     }
                 }
             }
+            return copy_to_clipboard_osc52(text);
         }
-        if arboard::Clipboard::new()
-            .and_then(|mut cb| cb.set_text(text.to_string()))
-            .is_ok()
+
+        #[cfg(target_os = "linux")]
         {
-            return true;
+            return copy_to_linux_clipboard(text);
         }
-        copy_to_clipboard_osc52(text)
+
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        {
+            copy_to_clipboard_osc52(text)
+        }
     }
 }
 
+#[cfg(all(target_os = "linux", not(test)))]
+fn copy_to_linux_clipboard(text: &str) -> bool {
+    let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let has_x11 = std::env::var_os("DISPLAY").is_some();
+
+    if has_wayland && copy_to_wayland_clipboard(text) {
+        return true;
+    }
+    if has_wayland || has_x11 {
+        return copy_to_retained_linux_clipboard(text);
+    }
+    copy_to_clipboard_osc52(text)
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn copy_to_wayland_clipboard(text: &str) -> bool {
+    let Ok(mut child) = std::process::Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    use std::io::Write;
+    let Some(mut stdin) = child.stdin.take() else {
+        return false;
+    };
+    if stdin.write_all(text.as_bytes()).is_err() {
+        return false;
+    }
+    drop(stdin);
+
+    // `wl-copy` keeps serving the selection after a successful write. Waiting
+    // for that owner would stall the UI, so only wait long enough to catch an
+    // immediate setup failure and reap a live owner in the background.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return true;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn copy_to_retained_linux_clipboard(text: &str) -> bool {
+    let Ok(mut clipboard) = LINUX_CLIPBOARD.lock() else {
+        return false;
+    };
+    if clipboard.is_none() {
+        *clipboard = arboard::Clipboard::new().ok();
+    }
+    let copied = clipboard
+        .as_mut()
+        .is_some_and(|clipboard| clipboard.set_text(text.to_string()).is_ok());
+    if !copied {
+        // A disconnected backend must be recreated on the next copy attempt.
+        *clipboard = None;
+    }
+    copied
+}
+
+#[cfg(not(test))]
 /// Copy to clipboard using the OSC 52 terminal escape sequence. This asks the
 /// terminal emulator to set the system clipboard without needing a local
 /// display server, making it work over SSH, inside Docker, and under tmux
