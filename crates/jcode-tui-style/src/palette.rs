@@ -78,6 +78,38 @@ pub enum Role {
     SelectionBg,
 }
 
+/// A bundled, complete color palette.
+///
+/// Presets are the starting point for `[display.colors]`: explicit role
+/// overrides are applied on top, so users can keep a preset while tuning one
+/// or two colors. `Default` preserves jcode's historical palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PalettePreset {
+    Default,
+    MonokaiDark,
+    MonokaiLight,
+}
+
+impl PalettePreset {
+    /// Parse a stable config value. Hyphens and underscores are equivalent.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "" | "default" => Some(Self::Default),
+            "monokai-dark" => Some(Self::MonokaiDark),
+            "monokai-light" => Some(Self::MonokaiLight),
+            _ => None,
+        }
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::MonokaiDark => "monokai-dark",
+            Self::MonokaiLight => "monokai-light",
+        }
+    }
+}
+
 /// All roles, in declaration order. Used by `/colors` listings and harmony
 /// analysis so a new role is automatically covered by both.
 pub const ALL_ROLES: &[Role] = &[
@@ -215,6 +247,23 @@ fn index_of(role: Role) -> usize {
 }
 
 impl Palette {
+    /// Create one of jcode's bundled palettes.
+    ///
+    /// Monokai Light is deliberately authored as a separate palette rather
+    /// than deriving from Monokai Dark by luminance inversion.
+    pub fn preset(preset: PalettePreset) -> Self {
+        let mut palette = Self::default();
+        let colors = match preset {
+            PalettePreset::Default => return palette,
+            PalettePreset::MonokaiDark => MONOKAI_DARK,
+            PalettePreset::MonokaiLight => MONOKAI_LIGHT,
+        };
+        for (role, rgb) in ALL_ROLES.iter().copied().zip(colors) {
+            palette.set(role, rgb);
+        }
+        palette
+    }
+
     /// RGB for `role`.
     pub fn rgb(&self, role: Role) -> (u8, u8, u8) {
         self.entries[index_of(role)]
@@ -250,7 +299,14 @@ impl Palette {
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
-        let mut palette = Self::default();
+        Self::from_pairs_on(Self::default(), pairs)
+    }
+
+    /// Apply user color overrides to a base palette.
+    pub fn from_pairs_on<'a, I>(mut palette: Self, pairs: I) -> (Self, Vec<String>)
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
         let mut errors = Vec::new();
         for (key, value) in pairs {
             match (Role::from_key(key), parse_hex(value)) {
@@ -265,6 +321,59 @@ impl Palette {
         (palette, errors)
     }
 }
+
+// Monokai's signature hues, authored separately for dark and light terminal
+// backgrounds. The order is `ALL_ROLES`; keeping the table adjacent to that
+// declaration makes additions compiler-visible through the fixed array size.
+const MONOKAI_DARK: [(u8, u8, u8); ALL_ROLES.len()] = [
+    (166, 226, 46),
+    (102, 217, 239),
+    (249, 38, 114),
+    (102, 217, 239),
+    (117, 113, 94),
+    (174, 129, 255),
+    (253, 151, 31),
+    (230, 219, 116),
+    (102, 217, 239),
+    (117, 113, 94),
+    (248, 248, 242),
+    (39, 40, 34),
+    (248, 248, 242),
+    (166, 226, 46),
+    (248, 248, 242),
+    (117, 113, 94),
+    (166, 226, 46),
+    (230, 219, 116),
+    (249, 38, 114),
+    (102, 217, 239),
+    (117, 113, 94),
+    (73, 72, 62),
+];
+
+const MONOKAI_LIGHT: [(u8, u8, u8); ALL_ROLES.len()] = [
+    (13, 103, 46),
+    (0, 102, 128),
+    (174, 54, 82),
+    (0, 102, 128),
+    (117, 113, 94),
+    (100, 58, 170),
+    (179, 75, 0),
+    (146, 97, 0),
+    (0, 102, 128),
+    (117, 113, 94),
+    (39, 40, 34),
+    (239, 239, 234),
+    (39, 40, 34),
+    (13, 103, 46),
+    (39, 40, 34),
+    (117, 113, 94),
+    (13, 103, 46),
+    (146, 97, 0),
+    (174, 54, 82),
+    (0, 102, 128),
+    (117, 113, 94),
+    (220, 220, 214),
+];
 
 /// Parse `#rrggbb`, `#rgb`, or a bare `rrggbb` hex string.
 pub fn parse_hex(text: &str) -> Option<(u8, u8, u8)> {
@@ -1007,5 +1116,51 @@ mod default_palette_is_frozen {
         for (role, expected) in HAND_TUNED.iter().copied() {
             assert_eq!(role.default_rgb(), expected, "{}", role.key());
         }
+    }
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::*;
+
+    #[test]
+    fn parses_stable_preset_names() {
+        assert_eq!(PalettePreset::parse(""), Some(PalettePreset::Default));
+        assert_eq!(
+            PalettePreset::parse("monokai_dark"),
+            Some(PalettePreset::MonokaiDark)
+        );
+        assert_eq!(
+            PalettePreset::parse("Monokai-Light"),
+            Some(PalettePreset::MonokaiLight)
+        );
+        assert_eq!(PalettePreset::parse("solarized"), None);
+    }
+
+    #[test]
+    fn monokai_presets_are_complete_and_independently_authored() {
+        let dark = Palette::preset(PalettePreset::MonokaiDark);
+        let light = Palette::preset(PalettePreset::MonokaiLight);
+        for role in ALL_ROLES.iter().copied() {
+            assert!(dark.is_overridden(role), "dark {}", role.key());
+            assert!(light.is_overridden(role), "light {}", role.key());
+        }
+        assert_eq!(dark.rgb(Role::UserBg), (39, 40, 34));
+        assert_eq!(light.rgb(Role::UserBg), (239, 239, 234));
+        // A luminance flip of dark's pink error would be a pale pink, not the
+        // deliberately darker red used by Monokai Light.
+        assert_eq!(dark.rgb(Role::Error), (249, 38, 114));
+        assert_eq!(light.rgb(Role::Error), (174, 54, 82));
+    }
+
+    #[test]
+    fn explicit_colors_override_the_selected_preset() {
+        let (palette, errors) = Palette::from_pairs_on(
+            Palette::preset(PalettePreset::MonokaiDark),
+            [("accent", "#010203")],
+        );
+        assert!(errors.is_empty());
+        assert_eq!(palette.rgb(Role::Accent), (1, 2, 3));
+        assert_eq!(palette.rgb(Role::Ai), (102, 217, 239));
     }
 }

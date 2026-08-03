@@ -5,9 +5,11 @@
 //! 1. `JCODE_THEME=dark|light` env override (also accepts `auto`).
 //! 2. `display.theme` config: "dark", "light", or "auto"/empty.
 //! 3. Auto: query the terminal's background color (OSC 11 via
-//!    `terminal-colorsaurus`) and classify by perceived lightness. Terminals
-//!    known not to support OSC queries are rejected before the bounded query so
-//!    they do not add hundreds of milliseconds to startup.
+//!    `terminal-colorsaurus`) and classify by perceived lightness. If OSC 11
+//!    is unavailable or cached as silent, use the conventional `COLORFGBG`
+//!    background index before falling back to dark. Terminals known not to
+//!    support OSC queries are rejected before the bounded query so they do not
+//!    add hundreds of milliseconds to startup.
 //! 4. Fallback: dark (jcode's native palette).
 //!
 //! The result is stored in `jcode_tui_style::theme_mode` where the renderer
@@ -99,7 +101,15 @@ pub fn init_theme_mode_for_resume(inherited_theme: Option<&str>) -> ThemeMode {
 /// calls it again after `/colors` edits so changes apply without a restart.
 pub fn init_palette() {
     let configured = &crate::config::config().display.colors;
-    let (palette, errors) = jcode_tui_style::Palette::from_pairs(
+    let palette_name = &crate::config::config().display.palette;
+    let preset = jcode_tui_style::PalettePreset::parse(palette_name).unwrap_or_else(|| {
+        crate::logging::warn(&format!(
+            "Unknown display.palette '{palette_name}' (expected default/monokai-dark/monokai-light); using default"
+        ));
+        jcode_tui_style::PalettePreset::Default
+    });
+    let (palette, errors) = jcode_tui_style::Palette::from_pairs_on(
+        jcode_tui_style::Palette::preset(preset),
         configured
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str())),
@@ -143,13 +153,42 @@ fn resolve_configured_theme(query_terminal: bool) -> ThemeMode {
     }
 
     if query_terminal {
-        detect_terminal_theme().unwrap_or(ThemeMode::Dark)
+        detect_terminal_theme()
+            .or_else(detect_colorfgbg_theme)
+            .unwrap_or(ThemeMode::Dark)
     } else {
         crate::logging::info(
-            "Skipping terminal background query during reload handoff; preserving a safe theme",
+            "Skipping terminal background query during reload handoff; using COLORFGBG if available",
         );
-        ThemeMode::Dark
+        detect_colorfgbg_theme().unwrap_or(ThemeMode::Dark)
     }
+}
+
+/// Resolve the conventional `COLORFGBG=foreground;background` terminal hint.
+///
+/// The final semicolon-separated field is the background ANSI/xterm color
+/// index. KDE's Yakuake propagates this even when its xterm-compatible layer
+/// does not reply to OSC 11, making it a useful zero-I/O fallback.
+fn detect_colorfgbg_theme() -> Option<ThemeMode> {
+    let value = std::env::var("COLORFGBG").ok()?;
+    theme_mode_from_colorfgbg(&value)
+}
+
+fn theme_mode_from_colorfgbg(value: &str) -> Option<ThemeMode> {
+    let background = value
+        .rsplit_once(';')
+        .map_or(value, |(_, background)| background)
+        .trim()
+        .parse::<u8>()
+        .ok()?;
+    let (r, g, b) = jcode_tui_style::color::indexed_to_rgb(background);
+    // Relative luminance: above the midpoint is a light terminal background.
+    let luminance = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+    Some(if luminance >= 128.0 {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    })
 }
 
 /// Query the terminal background color and classify it as dark or light.
@@ -308,8 +347,27 @@ fn terminal_background_query_supported(
 mod tests {
     use super::{
         SILENT_TERMINAL_CACHE_MAX, cache_silent_terminal_at, silent_terminal_is_cached_at,
-        terminal_background_query_supported,
+        terminal_background_query_supported, theme_mode_from_colorfgbg,
     };
+    use jcode_tui_style::ThemeMode;
+
+    #[test]
+    fn colorfgbg_fallback_recognizes_yakuake_dark_background() {
+        assert_eq!(theme_mode_from_colorfgbg("15;0"), Some(ThemeMode::Dark));
+    }
+
+    #[test]
+    fn colorfgbg_fallback_recognizes_light_background_and_xterm_indexes() {
+        assert_eq!(theme_mode_from_colorfgbg("0;15"), Some(ThemeMode::Light));
+        assert_eq!(theme_mode_from_colorfgbg("15;231"), Some(ThemeMode::Light));
+    }
+
+    #[test]
+    fn colorfgbg_fallback_rejects_values_without_a_background_index() {
+        assert_eq!(theme_mode_from_colorfgbg("default;light"), None);
+        assert_eq!(theme_mode_from_colorfgbg("15;default"), None);
+        assert_eq!(theme_mode_from_colorfgbg(""), None);
+    }
 
     #[test]
     fn skips_terminals_without_osc_query_support() {

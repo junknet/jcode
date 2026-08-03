@@ -1082,6 +1082,11 @@ pub struct DisplayConfig {
     /// adapts jcode's palette for light backgrounds. Default: auto.
     #[serde(default)]
     pub theme: String,
+    /// Bundled role palette: "default", "monokai-dark", or "monokai-light".
+    /// Empty is the historical default palette. Per-role `colors` override the
+    /// selected palette.
+    #[serde(default)]
+    pub palette: String,
     /// Per-role color overrides, e.g. `user = "#8ab4f8"`. Any TUI color can be
     /// configured: the named roles are substituted directly, and ad hoc shades
     /// used by widgets follow the role they belong to. Run `/colors` to list
@@ -1133,6 +1138,7 @@ impl Default for DisplayConfig {
             native_scrollbars: NativeScrollbarConfig::default(),
             keybinding_hints: true,
             theme: String::new(),
+            palette: String::new(),
             colors: std::collections::BTreeMap::new(),
             active_sessions_manager: false,
             overscroll_status: OverscrollStatusMode::default(),

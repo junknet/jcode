@@ -235,8 +235,13 @@ prompt_entry_animation = true
 # Empty = auto ("⌥" on macOS, "Alt" elsewhere). Examples: "Option", "Alt", "⌥".
 # copy_badge_alt_label = ""
 
-# Color theme: "auto" (query the terminal background), "dark", or "light".
+# Terminal background: "auto" (query OSC 11, then COLORFGBG), "dark", or "light".
 # theme = "auto"
+
+# Bundled role palette: "default", "monokai-dark", or "monokai-light".
+# A preset supplies deliberately authored colors; `monokai-light` is not an
+# inverted version of the dark palette. Per-role settings below take priority.
+# palette = "monokai-dark"
 
 # Per-role color overrides. Every color the TUI renders is configurable: the
 # named roles below are substituted directly, and the ad hoc shades individual
